@@ -55,6 +55,7 @@ class FakeHTTPAdapter(BaseAdapter):
         super().__init__()
         self.routes = {}
         self.requests = []
+        self.kwargs = []
 
     def add(self, url, body=b"", status=200, headers=None):
         self.routes[url] = (status, body, headers or {})
@@ -65,6 +66,7 @@ class FakeHTTPAdapter(BaseAdapter):
 
     def send(self, request, **kwargs):
         self.requests.append(request)
+        self.kwargs.append(kwargs)
         status, body, headers = self.routes.get(request.url, (404, b"not found", {}))
         if isinstance(body, Exception):
             raise body

@@ -2,13 +2,42 @@
 #
 # SPDX-License-Identifier: MIT
 
+from collections.abc import Callable
 import errno
 from io import BytesIO
 import locale
 from pathlib import Path
 from requests import Response, Request, Session, codes
 from requests.adapters import BaseAdapter
-from urllib.parse import unquote, urlparse
+from requests.exceptions import RequestException
+from urllib.parse import unquote, urljoin, urlparse, urlsplit
+
+
+class UnsafeRedirectError(RequestException):
+    """A redirect to a location with an unsupported or less secure scheme was refused."""
+
+
+def redirect_guard(allow_downgrade: bool = True) -> Callable[..., Response]:
+    """
+    Create a response hook which refuses to follow redirects to anything but HTTP(S) URLs,
+    e.g. into the local file transport. Unless ``allow_downgrade`` is set, redirects from
+    HTTPS to plain HTTP are refused as well.
+    """
+
+    def hook(response: Response, *args, **kwargs) -> Response:
+        if not response.is_redirect:
+            return response
+        target = urljoin(response.url, response.headers["Location"])
+        scheme = urlsplit(target).scheme.lower()
+        downgrade = scheme == "http" and urlsplit(response.url).scheme.lower() == "https"
+        if scheme not in ("http", "https") or (downgrade and not allow_downgrade):
+            response.close()
+            raise UnsafeRedirectError(
+                f"refusing redirect from '{response.url}' to '{target}'", response=response
+            )
+        return response
+
+    return hook
 
 
 class LocalFileAdapter(BaseAdapter):
