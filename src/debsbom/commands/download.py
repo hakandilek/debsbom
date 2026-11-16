@@ -23,9 +23,11 @@ try:
     # If it is missing, dependent modules are skipped to prevent import errors.
     from zstandard import ZstdCompressor, ZstdDecompressor
     import requests
+    from ..apt.remote import RemoteRepository
     from ..snapshot import client as sdlclient
     from ..download.adapters import LocalFileAdapter
     from ..download.download import PackageDownloader, DownloadStatus, DownloadResult
+    from ..download.mirror import MirrorResolver
     from ..download.resolver import (
         PackageResolverCache,
         PersistentResolverCache,
@@ -44,12 +46,24 @@ def setup_snapshot_resolver(session):
     return sdlclient.UpstreamResolver(sdl)
 
 
-RESOLVERS = {"debian-snapshot": setup_snapshot_resolver}
+def setup_mirror_resolver(session, url, suites, components=(), architectures=()):
+    """
+    Create the built-in ``debian-mirror`` resolver. Unlike the factories of resolver
+    plugins, it takes the repository configuration of the ``--mirror-*`` options.
+    The configuration is validated, but no request is made.
+    """
+    return MirrorResolver(RemoteRepository(session, url, suites, components, architectures))
+
+
+RESOLVERS = {"debian-snapshot": setup_snapshot_resolver, "debian-mirror": setup_mirror_resolver}
 
 resolver_endpoints = entry_points(group="debsbom.download.resolver")
 for ep in resolver_endpoints:
     setup_fn = ep.load()
     RESOLVERS[ep.name] = setup_fn
+
+#: options of the built-in debian-mirror resolver
+MIRROR_OPTIONS = ("mirror_url", "mirror_suite", "mirror_component", "mirror_architecture")
 
 
 class DownloadInput(SbomInput):
@@ -84,8 +98,38 @@ class DownloadInput(SbomInput):
         return rs
 
     @staticmethod
+    def _check_resolver_args(args) -> None:
+        """Validate the combination of resolver options, before anything is done."""
+        given = [o for o in MIRROR_OPTIONS if getattr(args, o, None) is not None]
+        if RESOLVERS.get(args.resolver) is not setup_mirror_resolver:
+            # also if a plugin replaces the debian-mirror resolver, as it cannot be configured
+            if given:
+                option = "--" + given[0].replace("_", "-")
+                raise ValueError(f"{option} requires the built-in 'debian-mirror' resolver")
+            return
+        if not args.mirror_url:
+            raise ValueError("the 'debian-mirror' resolver requires --mirror-url")
+        if not args.mirror_suite:
+            raise ValueError("the 'debian-mirror' resolver requires at least one --mirror-suite")
+
+    @staticmethod
     def _create_default_resolver(args, session, outdir) -> Resolver:
-        u_resolver = RESOLVERS[args.resolver](session)
+        DownloadInput._check_resolver_args(args)
+        setup_fn = RESOLVERS[args.resolver]
+        if setup_fn is setup_mirror_resolver:
+            # Not cached persistently: the cache is keyed by the package only, not by the
+            # repository configuration, and a repository changes over time.
+            try:
+                return setup_mirror_resolver(
+                    session,
+                    args.mirror_url,
+                    args.mirror_suite,
+                    args.mirror_component or (),
+                    args.mirror_architecture or (),
+                )
+            except ValueError as e:
+                raise ValueError(f"invalid mirror configuration: {e}") from e
+        u_resolver = setup_fn(session)
         if type(u_resolver.cache) is PackageResolverCache:
             cachedir = outdir / ".cache"
             cachedir.mkdir(exist_ok=True)
@@ -109,9 +153,10 @@ class DownloadInput(SbomInput):
                 files = list(resolver_cache._resolve_pkg(pkg))
                 DownloadCmd._check_for_dsc(pkg, files)
                 downloader.register(files, pkg)
-            except ResolveError:
+            except ResolveError as e:
                 pkg_type = "source" if pkg.is_source() else "binary"
-                logger.warning(f"failed to resolve {pkg_type} package: {pkg}")
+                reason = f": {e}" if str(e) else ""
+                logger.warning(f"failed to resolve {pkg_type} package: {pkg}{reason}")
                 if json:
                     print(
                         DownloadResult(
@@ -154,6 +199,40 @@ class DownloadInput(SbomInput):
             default="debian-snapshot",
             help="resolver to use to find upstream packages (default: %(default)s)",
         )
+        mirror = parser.add_argument_group(
+            "debian-mirror resolver",
+            "Options of the 'debian-mirror' resolver, which looks up packages in the indexes "
+            "of an APT repository, like a Debian mirror. The repository metadata is validated, "
+            "but its signatures are not verified.",
+        )
+        mirror.add_argument(
+            "--mirror-url",
+            metavar="URL",
+            help="archive root of the repository (http, https or file URL), "
+            "e.g. https://deb.debian.org/debian",
+        )
+        mirror.add_argument(
+            "--mirror-suite",
+            metavar="SUITE",
+            action="append",
+            help="suite to search, e.g. trixie. Can be repeated, suites are searched in order. "
+            "A suite ending with '/' is an exact path relative to the archive root (flat "
+            "repository), e.g. './'",
+        )
+        mirror.add_argument(
+            "--mirror-component",
+            metavar="COMPONENT",
+            action="append",
+            help="component to search in each suite, e.g. main. Can be repeated, components "
+            "are searched in order. Required for suites without exact path",
+        )
+        mirror.add_argument(
+            "--mirror-architecture",
+            metavar="ARCH",
+            action="append",
+            help="architecture of the indexes to search for 'Architecture: all' packages. "
+            "Can be repeated (default: the architectures of the Release file of the suite)",
+        )
 
 
 class DownloadCmd(DownloadInput, SourceBinaryInput, PkgStreamInput):
@@ -165,14 +244,16 @@ class DownloadCmd(DownloadInput, SourceBinaryInput, PkgStreamInput):
 
     @classmethod
     def run(cls, args):
+        cls._check_resolver_args(args)
         outdir = Path(args.outdir)
         outdir.mkdir(exist_ok=True)
+        rs = DownloadCmd._create_default_session()
+        # the resolver configuration is validated before any input is read
+        u_resolver = cls._create_default_resolver(args, rs, outdir)
         if cls.has_bomin(args):
             resolvers = cls.get_sbom_resolvers(args)
         else:
             resolvers = [cls.get_pkgstream_resolver()]
-        rs = DownloadCmd._create_default_session()
-        u_resolver = cls._create_default_resolver(args, rs, outdir)
         downloader = PackageDownloader(args.outdir, session=rs)
 
         if args.skip_pkgs:

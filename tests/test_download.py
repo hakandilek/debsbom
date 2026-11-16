@@ -11,7 +11,7 @@ import textwrap
 import jsonschema
 
 import pytest
-from debsbom.download.adapters import LocalFileAdapter
+from debsbom.download.adapters import LocalFileAdapter, UnsafeRedirectError
 from debsbom.download import (
     PackageDownloader,
     PersistentResolverCache,
@@ -699,3 +699,59 @@ def test_download_requests_identity_encoding(tmp_path, fake_http):
     dl.register([_remote(path, url=url)], SourcePackage("foo", "1.0-1"))
     assert [r.status for r in dl.download()] == [DownloadStatus.OK]
     assert adapter.requests[0].headers["Accept-Encoding"] == "identity"
+
+
+@pytest.mark.parametrize(
+    "location", ["file:///etc/hosts", "FILE://localhost/etc/hosts", "ftp://mirror.example/foo"]
+)
+def test_download_refuses_redirect_to_other_transport(tmp_path, fake_http, location):
+    """A remote server cannot redirect a download into the local file transport."""
+    rs, adapter = fake_http
+    path = _upstream_file(tmp_path, "foo_1.0_amd64.deb")
+    url = "https://mirror.example/foo_1.0_amd64.deb"
+    adapter.add(url, status=302, headers={"Location": location})
+    dl = PackageDownloader(tmp_path / "dl", session=rs)
+    dl.register([_remote(path, url=url)], BinaryPackage("foo", "1.0", architecture="amd64"))
+    with pytest.raises(UnsafeRedirectError, match="refusing redirect"):
+        list(dl.download())
+    assert adapter.urls == [url]
+    assert not (dl.binaries_dir / "debian" / path.name).exists()
+    assert not _tmp_files(dl)
+
+
+def test_download_follows_http_redirect(tmp_path, fake_http):
+    """Redirects to other HTTP(S) servers, like a CDN, are followed."""
+    rs, adapter = fake_http
+    path = _upstream_file(tmp_path, "foo_1.0_amd64.deb")
+    url = "https://mirror.example/foo_1.0_amd64.deb"
+    adapter.add(url, status=302, headers={"Location": "http://cdn.example/foo.deb"})
+    adapter.add("http://cdn.example/foo.deb", path.read_bytes())
+    dl = PackageDownloader(tmp_path / "dl", session=rs)
+    dl.register([_remote(path, url=url)], BinaryPackage("foo", "1.0", architecture="amd64"))
+    (result,) = dl.download()
+    assert result.status == DownloadStatus.OK
+    assert result.source == url
+    assert adapter.urls == [url, "http://cdn.example/foo.deb"]
+
+
+def test_resolver_plugin_factory_invocation(tmp_path, monkeypatch):
+    """Resolver factories are called with the session only and get a persistent cache."""
+    from debsbom.cli import setup_parser
+    from debsbom.commands import download as download_cmd
+
+    calls = []
+
+    class _Resolver(Resolver):
+        pass
+
+    def setup_resolver(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _Resolver()
+
+    monkeypatch.setitem(download_cmd.RESOLVERS, "debian-snapshot", setup_resolver)
+    args = setup_parser().parse_args(["download"])
+    session = Session()
+    resolver = download_cmd.DownloadCmd._create_default_resolver(args, session, tmp_path)
+    assert calls == [((session,), {})]
+    assert isinstance(resolver.cache, PersistentResolverCache)
+    assert resolver.cache.cachedir == tmp_path / ".cache" / "debian-snapshot"

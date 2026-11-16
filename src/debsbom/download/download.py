@@ -16,6 +16,7 @@ import sys
 import os
 
 from ..util.checksum import ChecksumAlgo, best_digest, calculate_checksums
+from .adapters import redirect_guard
 from .resolver import RemoteFile
 from ..dpkg import package
 from ..dpkg.package import Package
@@ -80,6 +81,8 @@ class PackageDownloader:
         self.to_download: list[tuple[package.Package, RemoteFile]] = []
         self.rs = session
         self.known_hashes = {}
+        # a remote server must not redirect into the local file transport
+        self._redirect_hook = redirect_guard()
 
         self.outdir.mkdir(exist_ok=True)
         for p in [self.sources_dir, self.binaries_dir]:
@@ -190,7 +193,12 @@ class PackageDownloader:
         hashes = {algo: hashlib.new(str(algo)) for algo in algorithms}
         size = 0
         # request the file as is, as a content-coding would alter the stored bytes
-        with self.rs.get(f.downloadurl, stream=True, headers={"Accept-Encoding": "identity"}) as r:
+        with self.rs.get(
+            f.downloadurl,
+            stream=True,
+            headers={"Accept-Encoding": "identity"},
+            hooks={"response": [self._redirect_hook]},
+        ) as r:
             r.raise_for_status()
             with open(dst, "wb") as fp:
                 while chunk := r.raw.read(_CHUNK_SIZE):
