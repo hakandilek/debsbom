@@ -106,6 +106,15 @@ It is also possible to download multiple packages by name, version and architect
     guestfs-tools 1.52.3-1 source
     EOF
 
+Packages can also be looked up in an APT repository, like a Debian mirror. Optionally, packages that are not available there, e.g. older versions, are looked up on ``snapshot.debian.org`` (see :doc:`/commands/download`):
+
+.. code-block:: bash
+
+    debsbom download --resolver debian-mirror \
+        --mirror-url https://deb.debian.org/debian \
+        --mirror-suite trixie --mirror-component main \
+        --snapshot-fallback sbom.cdx.json
+
 Alternatively, the download can be executed from the container image:
 
 .. code-block:: bash

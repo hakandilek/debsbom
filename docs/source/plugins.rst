@@ -6,7 +6,7 @@ Plugins
 Resolver Plugin
 ---------------
 
-In the ``download`` command ``debsbom`` is downloading packages described by an SBOM. For this it needs to resolve from the package to a download location. What resolver to use can be controlled by the ``--resolver`` flag. ``debsbom`` per default provides a resolver for the Debian snapshot mirror (snapshot.debian.org).
+In the ``download`` command ``debsbom`` is downloading packages described by an SBOM. For this it needs to resolve from the package to a download location. What resolver to use can be controlled by the ``--resolver`` flag. ``debsbom`` provides the ``debian-snapshot`` resolver for the Debian snapshot mirror (snapshot.debian.org), which is used per default, and the ``debian-mirror`` resolver for APT repositories, see :doc:`commands/download`.
 
 Builders of custom Debian distributions might have different repositories where packages can be downloaded from. Some of these solutions might not be publicly available, or its implementation not relevant for the general public for some other reason. In these cases code for a resolver for these repositories should not land in ``debsbom`` proper, but we still want to give the option to use it as a fully integrated part of ``debsbom``.
 
@@ -27,6 +27,8 @@ Plugin discovery happens by entry points. ``debsbom`` specifically looks for the
 
 The passed in ``request.Session`` is later used by ``debsbom`` to download the packages. It is not required to use it, but consider reusing it instead of opening a new session.
 
+The setup function is only called with the session. The options of the built-in ``debian-mirror`` resolver (``--mirror-*`` and ``--snapshot-fallback``) are not passed to plugins, and they are rejected for other resolvers. A plugin can replace a built-in resolver by using its name; the options of the ``debian-mirror`` resolver are rejected then as well. The Snapshot fallback of the ``debian-mirror`` resolver always uses the built-in Snapshot resolver, which only shares the cache of the ``debian-snapshot`` resolver if that is not replaced.
+
 The resolver itself needs to inherit from the ``Resolver`` class. See the documentation here: :ref:`package-resolving-label`. The important part here is implementing the ``resolve`` function, which takes a package representation and returns a list of ``RemoteFile``, the locations from where files associated with the package can be downloaded. A minimal implementation could look like this:
 
 .. code-block:: python
@@ -44,5 +46,9 @@ The resolver itself needs to inherit from the ``Resolver`` class. See the docume
             return my_remotefile
 
 All functionality required for implementing a plugin is exposed in the ``debsbom.download.plugin`` module.
+
+If the resolver keeps its default cache, ``debsbom`` attaches a persistent cache to it, which is stored in ``<outdir>/.cache/<resolver name>`` and keyed by the PURL and the checksums of a package.
+
+Before a file is reported as downloaded successfully, its ``size`` and its strongest checksum given in the ``RemoteFile`` are verified, if provided, and independently the checksum of the package from the SBOM (for binary packages and ``.dsc`` files). Files without checksums cannot be identified, so they are downloaded again in each run. All files of a source package need to have the same ``archive_name``, as they are expected in the same directory, e.g. by the ``source-merge`` command.
 
 A full example implementation can be found in the `debsbom-plugin-examples <https://github.com/Urist-McGit/debsbom-plugin-examples>`_ repository, which is kept up to date for all releases.
