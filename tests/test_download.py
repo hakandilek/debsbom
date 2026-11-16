@@ -5,6 +5,9 @@
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
 import jsonschema
 
 import pytest
@@ -14,7 +17,7 @@ from debsbom.download import (
     PersistentResolverCache,
 )
 from debsbom.download.download import DownloadResult, DownloadStatus
-from debsbom.download.resolver import NotFoundError
+from debsbom.download.resolver import NotFoundError, Resolver
 from debsbom.resolver import PackageResolver, PackageStreamResolver
 from debsbom import schema
 from debsbom.dpkg.package import (
@@ -344,6 +347,57 @@ def test_download_result_invalid():
     }
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(data, schema=schema.download)
+
+
+def test_cli_without_download_dependencies():
+    """
+    The CLI, and by that the offline generate command, must work without the optional
+    download dependencies. Before Python 3.14, annotations are evaluated eagerly, so
+    they must not refer to the guarded imports at class definition time.
+    """
+    code = textwrap.dedent("""
+        import sys
+
+        # simulate that the optional download dependencies are not installed
+        for mod in ("requests", "zstandard"):
+            sys.modules[mod] = None
+
+        from debsbom import cli
+
+        assert not cli.HAS_DOWNLOAD_DEPS
+        args = cli.setup_parser().parse_args(["generate", "--root", "does-not-exist"])
+        assert args.cmd == "generate"
+        """)
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_download_unresolved_json(tmp_path, monkeypatch, capsys):
+    """
+    Packages that cannot be resolved are reported as schema-conforming JSON lines.
+    """
+    from debsbom.cli import setup_parser
+    from debsbom.commands import download as download_cmd
+
+    class _NotFoundResolver(Resolver):
+        def resolve(self, p):
+            raise NotFoundError(f"{p} is not available")
+
+    monkeypatch.setitem(
+        download_cmd.RESOLVERS, "debian-snapshot", lambda session: _NotFoundResolver()
+    )
+    monkeypatch.setattr(
+        sys, "stdin", io.BufferedReader(io.BytesIO(b"foo 1.0-1 amd64\nbar 2.0-1 source\n"))
+    )
+    args = setup_parser().parse_args(["--json", "download", "--outdir", str(tmp_path / "dl")])
+    download_cmd.DownloadCmd.run(args)
+
+    results = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [r["package"]["name"] for r in results] == ["foo", "bar"]
+    for r in results:
+        jsonschema.validate(r, schema=schema.download)
+        assert r["status"] == "not_found"
+        assert r["source"] == ""
+        assert "path" not in r
 
 
 def test_local_file():

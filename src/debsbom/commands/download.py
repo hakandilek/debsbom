@@ -2,6 +2,9 @@
 #
 # SPDX-License-Identifier: MIT
 
+# Annotations reference the optional download dependencies, which may be missing.
+from __future__ import annotations
+
 from importlib.metadata import entry_points, version
 
 from collections import deque
@@ -112,7 +115,11 @@ class DownloadInput(SbomInput):
                 if json:
                     print(
                         DownloadResult(
-                            path=None, status=DownloadStatus.NOT_FOUND, package=pkg, filename=""
+                            path=None,
+                            status=DownloadStatus.NOT_FOUND,
+                            package=pkg,
+                            filename="",
+                            source="",
                         ).json()
                     )
 
