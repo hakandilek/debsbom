@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from importlib.metadata import entry_points, version
 
+import argparse
 from collections import deque
 from collections.abc import Iterable
 from io import BytesIO
@@ -29,6 +30,7 @@ try:
     from ..download.download import PackageDownloader, DownloadStatus, DownloadResult
     from ..download.mirror import MirrorResolver
     from ..download.resolver import (
+        FallbackResolver,
         PackageResolverCache,
         PersistentResolverCache,
         ResolveError,
@@ -63,7 +65,13 @@ for ep in resolver_endpoints:
     RESOLVERS[ep.name] = setup_fn
 
 #: options of the built-in debian-mirror resolver
-MIRROR_OPTIONS = ("mirror_url", "mirror_suite", "mirror_component", "mirror_architecture")
+MIRROR_OPTIONS = (
+    "mirror_url",
+    "mirror_suite",
+    "mirror_component",
+    "mirror_architecture",
+    "snapshot_fallback",
+)
 
 
 class DownloadInput(SbomInput):
@@ -104,13 +112,30 @@ class DownloadInput(SbomInput):
         if RESOLVERS.get(args.resolver) is not setup_mirror_resolver:
             # also if a plugin replaces the debian-mirror resolver, as it cannot be configured
             if given:
-                option = "--" + given[0].replace("_", "-")
+                option = given[0]
+                if option == "snapshot_fallback" and not args.snapshot_fallback:
+                    option = "no_snapshot_fallback"
+                option = "--" + option.replace("_", "-")
                 raise ValueError(f"{option} requires the built-in 'debian-mirror' resolver")
             return
         if not args.mirror_url:
             raise ValueError("the 'debian-mirror' resolver requires --mirror-url")
         if not args.mirror_suite:
             raise ValueError("the 'debian-mirror' resolver requires at least one --mirror-suite")
+
+    @staticmethod
+    def _create_snapshot_fallback(session, outdir) -> Resolver:
+        """
+        Create the built-in Snapshot resolver for the fallback of the debian-mirror resolver.
+        It shares the persistent cache of the debian-snapshot resolver, unless a plugin
+        replaces that one and owns its cache.
+        """
+        resolver = setup_snapshot_resolver(session)
+        if RESOLVERS.get("debian-snapshot") is setup_snapshot_resolver:
+            cachedir = outdir / ".cache"
+            cachedir.mkdir(exist_ok=True)
+            resolver.cache = PersistentResolverCache(cachedir / "debian-snapshot")
+        return resolver
 
     @staticmethod
     def _create_default_resolver(args, session, outdir) -> Resolver:
@@ -120,7 +145,7 @@ class DownloadInput(SbomInput):
             # Not cached persistently: the cache is keyed by the package only, not by the
             # repository configuration, and a repository changes over time.
             try:
-                return setup_mirror_resolver(
+                u_resolver = setup_mirror_resolver(
                     session,
                     args.mirror_url,
                     args.mirror_suite,
@@ -129,6 +154,11 @@ class DownloadInput(SbomInput):
                 )
             except ValueError as e:
                 raise ValueError(f"invalid mirror configuration: {e}") from e
+            # only packages the repository does not have may be looked up on snapshot
+            if args.snapshot_fallback:
+                fallback = DownloadInput._create_snapshot_fallback(session, outdir)
+                u_resolver = FallbackResolver(u_resolver, fallback)
+            return u_resolver
         u_resolver = setup_fn(session)
         if type(u_resolver.cache) is PackageResolverCache:
             cachedir = outdir / ".cache"
@@ -232,6 +262,13 @@ class DownloadInput(SbomInput):
             action="append",
             help="architecture of the indexes to search for 'Architecture: all' packages. "
             "Can be repeated (default: the architectures of the Release file of the suite)",
+        )
+        mirror.add_argument(
+            "--snapshot-fallback",
+            action=argparse.BooleanOptionalAction,
+            help="look up packages that are not found in the repository on "
+            "snapshot.debian.org, which receives the names and versions of these packages. "
+            "Repository errors do not fall back (default: no fallback)",
         )
 
 

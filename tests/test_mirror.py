@@ -28,10 +28,17 @@ from debsbom.download.mirror import (
     MirrorResolver,
     archive_label,
 )
-from debsbom.download.resolver import NotFoundError, PackageResolverCache, RemoteFile, Resolver
+from debsbom.download.resolver import (
+    FallbackResolver,
+    NotFoundError,
+    PackageResolverCache,
+    PersistentResolverCache,
+    RemoteFile,
+    Resolver,
+)
 from debsbom.dpkg.package import BinaryPackage, SourcePackage
 from debsbom.repack.merger import SourceArchiveMerger
-from debsbom.snapshot.client import UPSTREAM_ARCHIVE_ORDER
+from debsbom.snapshot.client import UPSTREAM_ARCHIVE_ORDER, UpstreamResolver
 from debsbom.util.checksum import ChecksumAlgo
 
 MD5 = ChecksumAlgo.MD5SUM
@@ -750,6 +757,35 @@ def cli(fake_http, monkeypatch, capsys, tmp_path):
 
 
 MIRROR_ARGS = ["--resolver", "debian-mirror", "--mirror-url", ROOT, "--mirror-suite", "trixie"]
+FALLBACK_ARGS = [*MIRROR_ARGS, "--mirror-component", "main", "--snapshot-fallback"]
+SNAPSHOT = "https://snapshot.debian.org"
+
+
+def serve_snapshot(adapter, name, version, files, arch="amd64"):
+    """Serve the files of a package with the snapshot API, the arch 'source' for sources."""
+    result, fileinfo = [], {}
+    for filename, data in files.items():
+        digest = sha1(data)
+        result.append({"hash": digest, "architecture": arch})
+        fileinfo[digest] = [
+            {
+                "name": filename,
+                "archive_name": "debian",
+                "path": f"/pool/main/{name[0]}/{name}",
+                "first_seen": "20250101T000000Z",
+                "size": len(data),
+            }
+        ]
+        adapter.add(f"{SNAPSHOT}/file/{digest}/{filename}", data)
+    if arch == "source":
+        api = f"/mr/package/{name}/{version}/srcfiles?fileinfo=1"
+    else:
+        api = f"/mr/binary/{name}/{version}/binfiles?fileinfo=1"
+    adapter.add(SNAPSHOT + api, json.dumps({"result": result, "fileinfo": fileinfo}).encode())
+
+
+def snapshot_requests(adapter) -> list[str]:
+    return [u for u in adapter.urls if u.startswith(SNAPSHOT)]
 
 
 def test_cli_defaults():
@@ -816,6 +852,11 @@ def test_cli_ordered_options(fake_http, tmp_path):
             + ["--mirror-suite", "trixie", "--mirror-component", "main"],
             "query or fragment",
         ),
+        (["--snapshot-fallback"], "--snapshot-fallback requires the built-in"),
+        (["--no-snapshot-fallback"], "--no-snapshot-fallback requires the built-in"),
+        (["--resolver", "debian-mirror", "--snapshot-fallback"], "requires --mirror-url"),
+        # the repository is validated before the fallback is set up
+        (MIRROR_ARGS + ["--snapshot-fallback"], "at least one component is required"),
     ],
 )
 def test_cli_invalid(cli, adapter, tmp_path, argv, match):
@@ -843,6 +884,8 @@ def test_cli_plugin_replaces_mirror(cli, monkeypatch, adapter):
     monkeypatch.setitem(download_cmd.RESOLVERS, "debian-mirror", setup_resolver)
     with pytest.raises(ValueError, match="requires the built-in"):
         cli(*MIRROR_ARGS, stdin=b"foo 1.0-1 amd64\n")
+    with pytest.raises(ValueError, match="--snapshot-fallback requires the built-in"):
+        cli("--resolver", "debian-mirror", "--snapshot-fallback", stdin=b"foo 1.0-1 amd64\n")
     (result,) = cli("--resolver", "debian-mirror", stdin=b"foo 1.0-1 amd64\n")
     assert result["status"] == "not_found"
     ((args, kwargs),) = calls
@@ -941,16 +984,25 @@ def test_cli_sbom(cli, tmp_path):
     ]
 
 
-def test_cli_skipped_packages_are_not_looked_up(cli, adapter):
+@pytest.mark.parametrize("fallback", [[], ["--snapshot-fallback"]])
+def test_cli_skipped_packages_are_not_looked_up(cli, adapter, fallback):
     repo = Repo()
     repo.add_binary()
     repo.publish(adapter)
-    args = MIRROR_ARGS + ["--mirror-component", "main"]
-    results = cli(*args, "--skip-pkgs", "foo 1.0-1 amd64", stdin=b"foo 1.0-1 amd64\n")
+    args = [*MIRROR_ARGS, "--mirror-component", "main", *fallback]
+    stdin = b"foo 1.0-1 amd64\nbar 1.0-1 amd64\n"
+    results = cli(*args, "--skip-pkgs", "foo 1.0-1 amd64\nbar 1.0-1 amd64", stdin=stdin)
     assert results == []
     assert adapter.requests == []
-    (result,) = cli(*args, stdin=b"foo 1.0-1 amd64\n")
+    (result,) = cli(*args, "--skip-pkgs", "bar 1.0-1 amd64", stdin=stdin)
     assert result["status"] == "ok"
+    assert snapshot_requests(adapter) == []
+    # only a package the repository does not have is looked up on snapshot
+    results = cli(*args, stdin=stdin)
+    assert [r["status"] for r in results] == ["not_found", "ok"]
+    assert snapshot_requests(adapter) == (
+        [f"{SNAPSHOT}/mr/binary/bar/1.0-1/binfiles?fileinfo=1"] if fallback else []
+    )
 
 
 def test_cli_resolution_error(cli, adapter, caplog):
@@ -962,3 +1014,190 @@ def test_cli_resolution_error(cli, adapter, caplog):
     assert result["source"] == ""
     assert "failed to resolve binary package: foo@1.0-1: cannot retrieve" in caplog.text
     assert "401" in caplog.text
+
+
+# snapshot fallback
+
+
+@pytest.mark.parametrize(
+    "option,fallback",
+    [
+        ([], None),
+        (["--snapshot-fallback"], True),
+        (["--no-snapshot-fallback"], False),
+        (["--snapshot-fallback", "--no-snapshot-fallback"], False),
+    ],
+)
+def test_cli_snapshot_fallback_option(fake_http, tmp_path, option, fallback):
+    session, adapter = fake_http
+    args = setup_parser().parse_args(
+        ["download", *MIRROR_ARGS, "--mirror-component", "main", *option]
+    )
+    assert args.snapshot_fallback is fallback
+    resolver = download_cmd.DownloadCmd._create_default_resolver(args, session, tmp_path)
+    if fallback:
+        assert isinstance(resolver, FallbackResolver)
+        assert isinstance(resolver.primary, MirrorResolver)
+        assert isinstance(resolver.fallback, UpstreamResolver)
+        assert resolver.fallback.sdl.rs is session
+        # only the snapshot resolver is cached, like the debian-snapshot resolver
+        assert type(resolver.cache) is PackageResolverCache
+        assert type(resolver.primary.cache) is PackageResolverCache
+        assert isinstance(resolver.fallback.cache, PersistentResolverCache)
+        assert resolver.fallback.cache.cachedir == tmp_path / ".cache" / "debian-snapshot"
+    else:
+        assert isinstance(resolver, MirrorResolver)
+        assert not (tmp_path / ".cache").exists()
+    assert adapter.requests == []
+
+
+def test_cli_snapshot_fallback_replaced_snapshot(fake_http, tmp_path, monkeypatch):
+    """The fallback uses the built-in snapshot resolver, without the cache of a replacement."""
+    session, adapter = fake_http
+    calls = []
+    monkeypatch.setitem(download_cmd.RESOLVERS, "debian-snapshot", calls.append)
+    args = setup_parser().parse_args(["download", *FALLBACK_ARGS])
+    resolver = download_cmd.DownloadCmd._create_default_resolver(args, session, tmp_path)
+    assert calls == []
+    assert isinstance(resolver.fallback, UpstreamResolver)
+    assert type(resolver.fallback.cache) is PackageResolverCache
+    assert not (tmp_path / ".cache").exists()
+
+
+@pytest.mark.parametrize("option", [[], ["--no-snapshot-fallback"]])
+def test_cli_snapshot_fallback_disabled(cli, adapter, tmp_path, option):
+    """By default, packages are not looked up on snapshot."""
+    repo = Repo()
+    repo.add_binary()
+    repo.publish(adapter)
+    serve_snapshot(adapter, "bar", "1.0-1", {"bar_1.0-1_amd64.deb": b"bar"})
+    args = [*MIRROR_ARGS, "--mirror-component", "main", *option]
+    results = cli(*args, stdin=b"foo 1.0-1 amd64\nbar 1.0-1 amd64\n")
+    assert [r["status"] for r in results] == ["not_found", "ok"]
+    assert snapshot_requests(adapter) == []
+    assert not (tmp_path / "downloads" / ".cache").exists()
+
+
+def test_cli_snapshot_fallback(cli, adapter, tmp_path):
+    """Only packages the repository does not have are looked up on snapshot."""
+    repo = Repo()
+    foo_dsc = repo.add_source()
+    foo_deb = repo.add_binary()
+    repo.publish(adapter)
+    bar_deb = b"bar 1.0-1 amd64"
+    serve_snapshot(adapter, "bar", "1.0-1", {"bar_1.0-1_amd64.deb": bar_deb})
+    bar_files = {"bar_1.0.orig.tar.gz": b"bar sources", "bar_1.0-1.debian.tar.xz": b"bar debian"}
+    bar_sources = {"bar_1.0-1.dsc": make_dsc("bar", files=bar_files), **bar_files}
+    serve_snapshot(adapter, "bar", "1.0-1", bar_sources, arch="source")
+    pkgs = ["foo 1.0-1 amd64", "foo 1.0-1 source", "bar 1.0-1 amd64", "bar 1.0-1 source"]
+    stdin = "\n".join([*pkgs, "baz 1.0-1 amd64"]).encode()
+
+    results = cli(*FALLBACK_ARGS, stdin=stdin)
+    assert [u for u in snapshot_requests(adapter) if "/mr/" in u] == [
+        f"{SNAPSHOT}/mr/binary/bar/1.0-1/binfiles?fileinfo=1",
+        f"{SNAPSHOT}/mr/package/bar/1.0-1/srcfiles?fileinfo=1",
+        f"{SNAPSHOT}/mr/binary/baz/1.0-1/binfiles?fileinfo=1",
+    ]
+    by_file = {r.get("filename") or r["package"]["name"]: r for r in results}
+    assert by_file.pop("baz")["status"] == "not_found"
+    expected = {
+        "foo_1.0-1_amd64.deb": ("binaries", LABEL, foo_deb),
+        "foo_1.0-1.dsc": ("sources", LABEL, foo_dsc),
+        **{n: ("sources", LABEL, d) for n, d in default_files("foo", "1.0-1").items()},
+        "bar_1.0-1_amd64.deb": ("binaries", "debian", bar_deb),
+        **{n: ("sources", "debian", d) for n, d in bar_sources.items()},
+    }
+    assert by_file.keys() == expected.keys()
+    downloads = tmp_path / "downloads"
+    for filename, (kind, archive, data) in expected.items():
+        r = by_file[filename]
+        assert r["status"] == "ok"
+        if archive == LABEL:
+            assert r["source"] == url(f"pool/main/f/foo/{filename}")
+        else:
+            assert r["source"] == f"{SNAPSHOT}/file/{sha1(data)}/{filename}"
+        assert (downloads / kind / archive / filename).read_bytes() == data
+    # each source package is complete in the directory of its archive
+    for p, archive in ((source("foo"), LABEL), (source("bar"), "debian")):
+        dsc = SourceArchiveMerger.locate_artifact(p, downloads / "sources")
+        assert dsc == downloads / "sources" / archive / p.dscfile()
+
+    # the repository is asked again, snapshot results are cached
+    adapter.requests.clear()
+    results = cli(*FALLBACK_ARGS, stdin=stdin)
+    assert sorted(r["status"] for r in results) == ["not_found"] + ["ok"] * len(expected)
+    assert url("dists/trixie/main/binary-amd64/Packages.xz") in adapter.urls
+    assert snapshot_requests(adapter) == []
+
+
+def test_snapshot_fallback_checksum_mismatch(fake_http, tmp_path):
+    """A package which differs from the one in the repository is looked up on snapshot."""
+    session, adapter = fake_http
+    repo = Repo()
+    data = repo.add_binary()
+    repo.publish(adapter)
+    rebuilt = b"rebuilt foo 1.0-1 amd64"
+    serve_snapshot(adapter, "foo", "1.0-1", {"foo_1.0-1_amd64.deb": rebuilt})
+    args = setup_parser().parse_args(["download", *FALLBACK_ARGS])
+    resolver = download_cmd.DownloadCmd._create_default_resolver(args, session, tmp_path)
+
+    (rf,) = resolver._resolve_pkg(binary(checksums={SHA256: sha256(data)}))
+    assert rf.downloadurl == url("pool/main/f/foo/foo_1.0-1_amd64.deb")
+    assert snapshot_requests(adapter) == []
+    (rf,) = resolver._resolve_pkg(binary(checksums={SHA256: sha256(rebuilt)}))
+    assert rf.downloadurl == f"{SNAPSHOT}/file/{sha1(rebuilt)}/foo_1.0-1_amd64.deb"
+    assert snapshot_requests(adapter) == [f"{SNAPSHOT}/mr/binary/foo/1.0-1/binfiles?fileinfo=1"]
+
+
+@pytest.mark.parametrize(
+    "pkg,path,body,status,reason",
+    [
+        # operational errors
+        ("foo 1.0-1 amd64", "binary-amd64/Packages.xz", b"", 401, "401"),
+        ("foo 1.0-1 amd64", "binary-amd64/Packages.xz", b"", 503, "503"),
+        (
+            "foo 1.0-1 amd64",
+            "binary-amd64/Packages.xz",
+            requests.ConnectTimeout("timed out"),
+            200,
+            "timed out",
+        ),
+        # metadata errors
+        ("foo 1.0-1 amd64", "binary-amd64/Packages.xz", b"this is not xz data", 200, "xz"),
+        ("foo 1.0-1 all", None, None, None, "configure the architectures"),
+        # integrity errors
+        ("foo 1.0-1 source", "foo_1.0-1.dsc", b"tampered", 200, "does not match"),
+        ("foo 1.0-1 source", "foo_1.0-1.dsc", b"", 404, "is listed in the metadata"),
+    ],
+)
+def test_cli_snapshot_fallback_errors(cli, adapter, caplog, pkg, path, body, status, reason):
+    """Repository errors are reported, they are no reason to look up a package on snapshot."""
+    repo = Repo()
+    repo.add_source()
+    repo.add_binary()
+    repo.publish(adapter)
+    if path:
+        directory = "pool/main/f/foo" if path.endswith(".dsc") else "dists/trixie/main"
+        adapter.add(url(f"{directory}/{path}"), body, status=status)
+    with caplog.at_level(logging.WARNING):
+        (result,) = cli(*FALLBACK_ARGS, stdin=f"{pkg}\n".encode())
+    assert result["status"] == "not_found"
+    assert reason in caplog.text
+    assert snapshot_requests(adapter) == []
+
+
+def test_cli_snapshot_fallback_download_failure(cli, adapter):
+    """
+    The fallback applies to resolving: a file the repository lists, but fails to provide,
+    is not downloaded from snapshot instead.
+    """
+    repo = Repo()
+    data = repo.add_binary()
+    repo.publish(adapter)
+    deb = url("pool/main/f/foo/foo_1.0-1_amd64.deb")
+    adapter.add(deb, b"", status=404)
+    serve_snapshot(adapter, "foo", "1.0-1", {"foo_1.0-1_amd64.deb": data})
+    with pytest.raises(requests.HTTPError, match="404"):
+        cli(*FALLBACK_ARGS, stdin=b"foo 1.0-1 amd64\n")
+    assert adapter.urls[-1] == deb
+    assert snapshot_requests(adapter) == []

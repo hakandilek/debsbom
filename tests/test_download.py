@@ -17,7 +17,14 @@ from debsbom.download import (
     PersistentResolverCache,
 )
 from debsbom.download.download import DownloadResult, DownloadStatus
-from debsbom.download.resolver import NotFoundError, RemoteFile, Resolver
+from debsbom.download.resolver import (
+    FallbackResolver,
+    NotFoundError,
+    PackageResolverCache,
+    RemoteFile,
+    ResolveError,
+    Resolver,
+)
 from debsbom.resolver import PackageResolver, PackageStreamResolver
 from debsbom import schema
 from debsbom.dpkg.package import (
@@ -190,6 +197,126 @@ def test_resolver_cache_negative(tmpdir):
     with pytest.raises(NotFoundError):
         urs._resolve_pkg(pkg)
     assert urs.calls == 3
+
+
+class _StubResolver(Resolver):
+    """Raises or lazily returns the given result."""
+
+    def __init__(self, result, cache=None):
+        super().__init__(cache)
+        self.result = result
+        self.calls = 0
+
+    def resolve(self, p):
+        self.calls += 1
+        if isinstance(self.result, Exception):
+            raise self.result
+        if callable(self.result):
+            return self.result()
+        return iter(self.result)
+
+
+def _stub_file(name):
+    return RemoteFile(
+        checksums={},
+        filename=name,
+        archive_name="debian",
+        downloadurl=f"https://example.org/{name}",
+    )
+
+
+PRIMARY = [_stub_file("primary.dsc"), _stub_file("primary.orig.tar.gz")]
+FALLBACK = [_stub_file("fallback.dsc"), _stub_file("fallback.orig.tar.gz")]
+
+
+def _partial(exc):
+    """A result which fails after the first file."""
+
+    def result():
+        yield PRIMARY[0]
+        raise exc
+
+    return result
+
+
+@pytest.mark.parametrize(
+    "primary,fallback,expected",
+    [
+        (PRIMARY, FALLBACK, PRIMARY),
+        (NotFoundError("missing"), FALLBACK, FALLBACK),
+        # an empty result is not a success
+        ([], FALLBACK, FALLBACK),
+        # files of both resolvers are not mixed
+        (_partial(NotFoundError("missing")), FALLBACK, FALLBACK),
+    ],
+)
+def test_fallback_resolver(primary, fallback, expected):
+    pkg = SourcePackage(name="foo", version="1.0-1")
+    primary = _StubResolver(primary)
+    fallback = _StubResolver(fallback)
+    resolver = FallbackResolver(primary, fallback)
+    assert resolver._resolve_pkg(pkg) == expected
+    assert primary.calls == 1
+    assert fallback.calls == (0 if expected is PRIMARY else 1)
+
+
+@pytest.mark.parametrize(
+    "primary,fallback,exc,match,fallback_calls",
+    [
+        # only packages which are not found fall back
+        (ResolveError("unauthorized"), FALLBACK, ResolveError, "^unauthorized$", 0),
+        (_partial(ResolveError("reset")), FALLBACK, ResolveError, "^reset$", 0),
+        (RuntimeError("bug"), FALLBACK, RuntimeError, "^bug$", 0),
+        (
+            NotFoundError("missing"),
+            NotFoundError("gone"),
+            NotFoundError,
+            "^missing; not found by the fallback resolver: gone$",
+            1,
+        ),
+        (
+            NotFoundError(),
+            [],
+            NotFoundError,
+            "^not found; not found by the fallback resolver: no matching files found$",
+            1,
+        ),
+        # errors of the fallback resolver are reported as they are
+        (NotFoundError("missing"), ResolveError("timeout"), ResolveError, "^timeout$", 1),
+    ],
+)
+def test_fallback_resolver_errors(primary, fallback, exc, match, fallback_calls):
+    pkg = BinaryPackage(name="foo", version="1.0-1", architecture="amd64")
+    fallback = _StubResolver(fallback)
+    resolver = FallbackResolver(_StubResolver(primary), fallback)
+    with pytest.raises(exc, match=match) as e:
+        resolver._resolve_pkg(pkg)
+    assert isinstance(e.value, NotFoundError) == (exc is NotFoundError)
+    assert fallback.calls == fallback_calls
+
+
+def test_fallback_resolver_cache(tmp_path):
+    """Both resolvers use their own cache, the composition is not cached."""
+    foo = BinaryPackage(name="foo", version="1.0-1", architecture="amd64")
+    bar = BinaryPackage(name="bar", version="1.0-1", architecture="amd64")
+    primary = _StubResolver(NotFoundError("missing"))
+    fallback = _StubResolver(NotFoundError("gone"), PersistentResolverCache(tmp_path / "cache"))
+    resolver = FallbackResolver(primary, fallback)
+    assert type(resolver.cache) is PackageResolverCache
+    for _ in range(2):
+        with pytest.raises(NotFoundError, match="^missing; not found by the fallback resolver"):
+            resolver._resolve_pkg(foo)
+    # the negative result of the fallback resolver is cached
+    assert (primary.calls, fallback.calls) == (2, 1)
+
+    fallback.result = FALLBACK
+    for _ in range(2):
+        assert resolver._resolve_pkg(bar) == FALLBACK
+    assert (primary.calls, fallback.calls) == (4, 2)
+    # the primary resolver is asked first, regardless of the cache of the fallback resolver
+    primary.result = PRIMARY
+    assert resolver._resolve_pkg(bar) == PRIMARY
+    assert (primary.calls, fallback.calls) == (5, 2)
 
 
 @pytest.mark.online
